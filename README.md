@@ -27,7 +27,7 @@ Then open the local URL shown by Streamlit.
 - Add a compatible `.pt` model file to the deployed app repo (for example `models/model.pt`).
 - `requirements.txt` installs `torch`, `python-chess`, and `streamlit`.
 - The app runs inference on CPU only (no GPU required).
-- `packages.txt` is included as an APT-package placeholder (not needed by default).
+- No Linux system packages are required by default (add `packages.txt` only if needed).
 
 ## Deploy on Streamlit Community Cloud
 1. Put this folder in its own repo (or move it so it becomes the repo root).
@@ -37,7 +37,7 @@ Then open the local URL shown by Streamlit.
    - Commit a small/medium `.pt` artifact into `models/` (recommended for auto-load), or
    - Deploy without a bundled model and upload a `.pt` file in the sidebar after launch.
 5. In Streamlit Cloud, create the app and point it at this repo/root.
-6. If you later need Linux system packages, add them to `packages.txt` (one per line).
+6. If you later need Linux system packages, create `packages.txt` and add one package name per line.
 
 If your model file is large, runtime upload is usually the simplest path for a demo.
 
