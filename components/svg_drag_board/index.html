@@ -1,0 +1,404 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SVG Drag Board</title>
+  <style>
+    :root {
+      color-scheme: light;
+    }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: transparent;
+      overflow: hidden;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+    }
+    #root {
+      width: 100%;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 4px 0;
+      box-sizing: border-box;
+    }
+    svg {
+      display: block;
+      width: 100%;
+      max-width: 560px;
+      height: auto;
+      touch-action: none;
+      user-select: none;
+    }
+    .piece {
+      cursor: grab;
+    }
+    .piece.dragging {
+      cursor: grabbing;
+      opacity: 0.95;
+    }
+    .disabled .piece {
+      cursor: default;
+    }
+    .legend {
+      fill: #555;
+      font-size: 12px;
+      font-family: ui-sans-serif, system-ui, sans-serif;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script>
+    (function () {
+      const renderTarget = new EventTarget();
+      const RENDER_EVENT = "streamlit:render";
+
+      function post(type, extra) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type }, extra || {}),
+          "*",
+        );
+      }
+
+      window.Streamlit = {
+        RENDER_EVENT,
+        events: {
+          addEventListener(name, cb) {
+            renderTarget.addEventListener(name, cb);
+          },
+          removeEventListener(name, cb) {
+            renderTarget.removeEventListener(name, cb);
+          },
+        },
+        setComponentReady() {
+          post("streamlit:componentReady", { apiVersion: 1 });
+        },
+        setFrameHeight(height) {
+          post("streamlit:setFrameHeight", { height: Number(height) || 0 });
+        },
+        setComponentValue(value) {
+          post("streamlit:setComponentValue", { value });
+        },
+      };
+
+      window.addEventListener("message", (event) => {
+        const data = event.data || {};
+        if (!data || data.type !== "streamlit:render") return;
+        renderTarget.dispatchEvent(new CustomEvent(RENDER_EVENT, { detail: data }));
+      });
+    })();
+  </script>
+  <script>
+    const Streamlit = window.Streamlit;
+    const root = document.getElementById("root");
+
+    const PIECE_TEXT = {
+      P: "\u2659", N: "\u2658", B: "\u2657", R: "\u2656", Q: "\u2655", K: "\u2654",
+      p: "\u265F", n: "\u265E", b: "\u265D", r: "\u265C", q: "\u265B", k: "\u265A",
+    };
+
+    const state = {
+      fen: "",
+      orientation: "white",
+      disabled: false,
+      lastmoveUci: "",
+      pieceAssets: {},
+      board: {},
+      turn: "w",
+      drag: null,
+      squareSize: 64,
+      boardPx: 512,
+      pad: 24,
+      viewBox: 560,
+    };
+
+    function parseFen(fen) {
+      const [placement, turn] = fen.split(" ");
+      const board = {};
+      const ranks = placement.split("/");
+      for (let r = 0; r < 8; r += 1) {
+        let file = 0;
+        for (const ch of ranks[r]) {
+          if (/\d/.test(ch)) {
+            file += Number(ch);
+            continue;
+          }
+          const rank = 8 - r;
+          const sq = String.fromCharCode(97 + file) + String(rank);
+          board[sq] = ch;
+          file += 1;
+        }
+      }
+      return { board, turn };
+    }
+
+    function squareToCell(square, orientation) {
+      const file = square.charCodeAt(0) - 97;
+      const rank = Number(square[1]) - 1;
+      if (orientation === "black") {
+        return { col: 7 - file, row: rank };
+      }
+      return { col: file, row: 7 - rank };
+    }
+
+    function cellToSquare(col, row, orientation) {
+      if (col < 0 || col > 7 || row < 0 || row > 7) return null;
+      let file, rank;
+      if (orientation === "black") {
+        file = 7 - col;
+        rank = row + 1;
+      } else {
+        file = col;
+        rank = 8 - row;
+      }
+      return String.fromCharCode(97 + file) + String(rank);
+    }
+
+    function squareCenter(square) {
+      const { col, row } = squareToCell(square, state.orientation);
+      const x = state.pad + col * state.squareSize + state.squareSize / 2;
+      const y = state.pad + row * state.squareSize + state.squareSize / 2;
+      return { x, y };
+    }
+
+    function pointToSquare(clientX, clientY, svg) {
+      const rect = svg.getBoundingClientRect();
+      const scaleX = state.viewBox / rect.width;
+      const scaleY = state.viewBox / rect.height;
+      const x = (clientX - rect.left) * scaleX;
+      const y = (clientY - rect.top) * scaleY;
+      const bx = x - state.pad;
+      const by = y - state.pad;
+      if (bx < 0 || by < 0 || bx >= state.boardPx || by >= state.boardPx) return null;
+      const col = Math.floor(bx / state.squareSize);
+      const row = Math.floor(by / state.squareSize);
+      return cellToSquare(col, row, state.orientation);
+    }
+
+    function pieceColor(piece) {
+      return piece && piece === piece.toUpperCase() ? "w" : "b";
+    }
+
+    function parseLastmoveSquares(uci) {
+      if (!uci || uci.length < 4) return [];
+      return [uci.slice(0, 2), uci.slice(2, 4)];
+    }
+
+    function maybePromotionUci(from, to, piece) {
+      if (!piece) return from + to;
+      if ((piece === "P" && to[1] === "8") || (piece === "p" && to[1] === "1")) {
+        return from + to + "q";
+      }
+      return from + to;
+    }
+
+    function emitMove(moveUci) {
+      Streamlit.setComponentValue({
+        move_uci: moveUci,
+        event_id: String(Date.now()) + "-" + Math.random().toString(36).slice(2, 8),
+      });
+    }
+
+    function render() {
+      root.innerHTML = "";
+      const wrap = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+      wrap.setAttribute("viewBox", `0 0 ${state.viewBox} ${state.viewBox}`);
+      wrap.setAttribute("aria-label", "Draggable chessboard");
+      if (state.disabled) wrap.classList.add("disabled");
+
+      const bg = document.createElementNS(wrap.namespaceURI, "rect");
+      bg.setAttribute("x", "0");
+      bg.setAttribute("y", "0");
+      bg.setAttribute("width", String(state.viewBox));
+      bg.setAttribute("height", String(state.viewBox));
+      bg.setAttribute("fill", "#f7f6f2");
+      wrap.appendChild(bg);
+
+      const lastmoveSquares = new Set(parseLastmoveSquares(state.lastmoveUci));
+      if (state.drag && state.drag.hoverSquare) lastmoveSquares.add(state.drag.hoverSquare);
+
+      for (let row = 0; row < 8; row += 1) {
+        for (let col = 0; col < 8; col += 1) {
+          const x = state.pad + col * state.squareSize;
+          const y = state.pad + row * state.squareSize;
+          const square = cellToSquare(col, row, state.orientation);
+          const dark = (row + col) % 2 === 1;
+          let fill = dark ? "#769656" : "#eeeed2";
+          if (square && lastmoveSquares.has(square)) {
+            fill = dark ? "#baca44" : "#f6f669";
+          }
+          const sq = document.createElementNS(wrap.namespaceURI, "rect");
+          sq.setAttribute("x", String(x));
+          sq.setAttribute("y", String(y));
+          sq.setAttribute("width", String(state.squareSize));
+          sq.setAttribute("height", String(state.squareSize));
+          sq.setAttribute("fill", fill);
+          wrap.appendChild(sq);
+        }
+      }
+
+      for (let i = 0; i < 8; i += 1) {
+        const fileSquare = cellToSquare(i, 7, state.orientation);
+        const rankSquare = cellToSquare(0, i, state.orientation);
+        const fileText = document.createElementNS(wrap.namespaceURI, "text");
+        fileText.setAttribute("x", String(state.pad + i * state.squareSize + 4));
+        fileText.setAttribute("y", String(state.pad + state.boardPx - 4));
+        fileText.setAttribute("class", "legend");
+        fileText.textContent = fileSquare ? fileSquare[0] : "";
+        wrap.appendChild(fileText);
+
+        const rankText = document.createElementNS(wrap.namespaceURI, "text");
+        rankText.setAttribute("x", String(state.pad + 4));
+        rankText.setAttribute("y", String(state.pad + i * state.squareSize + 14));
+        rankText.setAttribute("class", "legend");
+        rankText.textContent = rankSquare ? rankSquare[1] : "";
+        wrap.appendChild(rankText);
+      }
+
+      const overlay = document.createElementNS(wrap.namespaceURI, "g");
+      wrap.appendChild(overlay);
+
+      for (const [square, piece] of Object.entries(state.board)) {
+        if (state.drag && square === state.drag.from) continue;
+        const c = squareCenter(square);
+        const href = state.pieceAssets[piece];
+        if (href) {
+          const img = document.createElementNS(wrap.namespaceURI, "image");
+          const size = state.squareSize * 0.9;
+          img.setAttribute("x", String(c.x - size / 2));
+          img.setAttribute("y", String(c.y - size / 2));
+          img.setAttribute("width", String(size));
+          img.setAttribute("height", String(size));
+          img.setAttribute("href", href);
+          img.setAttribute("data-square", square);
+          img.setAttribute("data-piece", piece);
+          img.setAttribute("class", "piece");
+          img.style.pointerEvents = "auto";
+          overlay.appendChild(img);
+        } else {
+          const text = document.createElementNS(wrap.namespaceURI, "text");
+          text.setAttribute("x", String(c.x));
+          text.setAttribute("y", String(c.y + 18));
+          text.setAttribute("text-anchor", "middle");
+          text.setAttribute("font-size", "54");
+          text.setAttribute("data-square", square);
+          text.setAttribute("data-piece", piece);
+          text.setAttribute("class", "piece");
+          text.style.pointerEvents = "auto";
+          text.textContent = PIECE_TEXT[piece] || "?";
+          overlay.appendChild(text);
+        }
+      }
+
+      if (state.drag) {
+        const ringSq = state.drag.hoverSquare || state.drag.from;
+        if (ringSq) {
+          const cc = squareCenter(ringSq);
+          const ring = document.createElementNS(wrap.namespaceURI, "circle");
+          ring.setAttribute("cx", String(cc.x));
+          ring.setAttribute("cy", String(cc.y));
+          ring.setAttribute("r", String(state.squareSize * 0.36));
+          ring.setAttribute("fill", "none");
+          ring.setAttribute("stroke", "#1f6feb");
+          ring.setAttribute("stroke-width", "4");
+          ring.setAttribute("opacity", "0.75");
+          wrap.appendChild(ring);
+        }
+        const dragHref = state.pieceAssets[state.drag.piece];
+        if (dragHref) {
+          const dragImg = document.createElementNS(wrap.namespaceURI, "image");
+          const size = state.squareSize * 0.9;
+          dragImg.setAttribute("x", String(state.drag.x - size / 2));
+          dragImg.setAttribute("y", String(state.drag.y - size / 2));
+          dragImg.setAttribute("width", String(size));
+          dragImg.setAttribute("height", String(size));
+          dragImg.setAttribute("href", dragHref);
+          dragImg.setAttribute("class", "piece dragging");
+          dragImg.setAttribute("opacity", "0.95");
+          wrap.appendChild(dragImg);
+        } else {
+          const dragText = document.createElementNS(wrap.namespaceURI, "text");
+          dragText.setAttribute("x", String(state.drag.x));
+          dragText.setAttribute("y", String(state.drag.y + 18));
+          dragText.setAttribute("text-anchor", "middle");
+          dragText.setAttribute("font-size", "54");
+          dragText.setAttribute("class", "piece dragging");
+          dragText.setAttribute("opacity", "0.95");
+          dragText.textContent = PIECE_TEXT[state.drag.piece] || "?";
+          wrap.appendChild(dragText);
+        }
+      }
+
+      function canDragPiece(piece) {
+        return pieceColor(piece) === state.turn && !state.disabled;
+      }
+
+      wrap.addEventListener("pointerdown", (ev) => {
+        const t = ev.target;
+        if (!t || !t.dataset) return;
+        const square = t.dataset.square;
+        const piece = t.dataset.piece;
+        if (!square || !piece || !canDragPiece(piece)) return;
+        ev.preventDefault();
+        const hoverSquare = pointToSquare(ev.clientX, ev.clientY, wrap);
+        state.drag = { from: square, piece, x: 0, y: 0, hoverSquare };
+        const rect = wrap.getBoundingClientRect();
+        state.drag.x = (ev.clientX - rect.left) * (state.viewBox / rect.width);
+        state.drag.y = (ev.clientY - rect.top) * (state.viewBox / rect.height);
+        try { wrap.setPointerCapture(ev.pointerId); } catch (e) {}
+        render();
+      });
+
+      wrap.addEventListener("pointermove", (ev) => {
+        if (!state.drag) return;
+        const rect = wrap.getBoundingClientRect();
+        state.drag.x = (ev.clientX - rect.left) * (state.viewBox / rect.width);
+        state.drag.y = (ev.clientY - rect.top) * (state.viewBox / rect.height);
+        state.drag.hoverSquare = pointToSquare(ev.clientX, ev.clientY, wrap);
+        render();
+      });
+
+      function endDrag(ev) {
+        if (!state.drag) return;
+        const drag = state.drag;
+        const toSquare = pointToSquare(ev.clientX, ev.clientY, wrap);
+        state.drag = null;
+        render();
+        if (!toSquare || toSquare === drag.from) return;
+        emitMove(maybePromotionUci(drag.from, toSquare, drag.piece));
+      }
+
+      wrap.addEventListener("pointerup", endDrag);
+      wrap.addEventListener("pointercancel", () => {
+        if (!state.drag) return;
+        state.drag = null;
+        render();
+      });
+
+      root.appendChild(wrap);
+      Streamlit.setFrameHeight(576);
+    }
+
+    function onRender(event) {
+      const args = (event && event.detail && event.detail.args) || {};
+      state.fen = args.fen || "8/8/8/8/8/8/8/8 w - - 0 1";
+      state.orientation = (args.orientation === "black") ? "black" : "white";
+      state.disabled = Boolean(args.disabled);
+      state.lastmoveUci = args.lastmove_uci || "";
+      state.pieceAssets = args.piece_assets || {};
+      const parsed = parseFen(state.fen);
+      state.board = parsed.board;
+      state.turn = parsed.turn || "w";
+      state.drag = null;
+      render();
+    }
+
+    Streamlit.events.addEventListener(Streamlit.RENDER_EVENT, onRender);
+    Streamlit.setComponentReady();
+    Streamlit.setFrameHeight(576);
+  </script>
+</body>
+</html>
